@@ -144,6 +144,52 @@ test("5. Insolvent Borrower Repayment Failure Triggers Atomic Rollback", async (
   // Verify state integrity preserved
   const reserve = engine.getReserve("USDC");
   assert.equal(reserve.totalLiquidity, 10_000_000n);
+  assert.equal(engine.getVaultBalance("USDC"), 10_000_000n);
+});
+
+test("5b. Absent Repayment Options Fails Closed With Immediate Rollback (P0)", async () => {
+  const { engine } = setupEngine();
+  engine.depositLiquidity("0xLpProvider", "USDC", 10_000_000n);
+
+  const nonRepayingReceiver = {
+    address: "0xNonRepayingBorrower",
+    async onFlashLoan() {
+      // Returns success callback hash but performs no repayment whatsoever
+      return ERC3156_CALLBACK_SUCCESS;
+    }
+  };
+
+  // Calling without any repayment options MUST fail closed
+  await assert.rejects(
+    () => engine.flashLoan(nonRepayingReceiver, "USDC", 2_000_000n),
+    /REPAYMENT_INSUFFICIENT_OR_FAILED/
+  );
+
+  // Verify zero state mutation: liquidity and vault balance untouched
+  const reserve = engine.getReserve("USDC");
+  assert.equal(reserve.totalLiquidity, 10_000_000n);
+  assert.equal(engine.getVaultBalance("USDC"), 10_000_000n);
+  assert.equal(reserve.accruedProtocolFees, 0n);
+});
+
+test("5c. Direct In-Callback Repayment via repayFlashLoan Succeeds", async () => {
+  const { engine } = setupEngine();
+  engine.depositLiquidity("0xLpProvider", "USDC", 10_000_000n);
+
+  const directRepayingReceiver = {
+    address: "0xDirectRepayingBorrower",
+    async onFlashLoan(initiator, token, amount, fee) {
+      // Repay amount + fee directly to the engine vault during callback
+      engine.repayFlashLoan(token, amount + fee);
+      return ERC3156_CALLBACK_SUCCESS;
+    }
+  };
+
+  const receipt = await engine.flashLoan(directRepayingReceiver, "USDC", 1_000_000n);
+  assert.equal(receipt.success, true);
+  assert.equal(receipt.amount, 1_000_000n);
+  assert.equal(receipt.fee, 900n);
+  assert.equal(engine.getVaultBalance("USDC"), 10_000_900n);
 });
 
 test("6. Asymmetric Cryptographic Admin Intents & Monotonic Replay Protection", () => {

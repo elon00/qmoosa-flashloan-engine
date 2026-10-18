@@ -9,12 +9,14 @@ import { AdminAuthManager } from "./auth.js";
 
 export interface FlashLoanExecutionOptions {
   initiator?: string;
+  repay?: ((repayAmount: bigint) => Promise<boolean | bigint> | boolean | bigint) | boolean;
   simulateRepayment?: (repayAmount: bigint) => Promise<boolean> | boolean;
 }
 
 export class FlashLoanEngine {
   private readonly reserves: Map<string, PoolReserve> = new Map();
   private readonly lpBalances: Map<string, Map<string, bigint>> = new Map();
+  private readonly vaultBalances: Map<string, bigint> = new Map();
   private protocolShareBps: bigint = 3000n; // 30% protocol treasury, 70% LP pool
   private treasuryAddress: string;
   private readonly authManager: AdminAuthManager;
@@ -39,6 +41,22 @@ export class FlashLoanEngine {
     return Array.from(this.reserves.values()).map(r => ({ ...r }));
   }
 
+  public getVaultBalance(token: string): bigint {
+    return this.vaultBalances.get(token.toUpperCase()) || 0n;
+  }
+
+  public repayFlashLoan(token: string, amount: bigint): void {
+    if (amount <= 0n) {
+      throw new Error("ZERO_AMOUNT_NOT_PERMITTED");
+    }
+    const symbol = token.toUpperCase();
+    if (!this.reserves.has(symbol)) {
+      throw new Error(`UNSUPPORTED_TOKEN: ${symbol}`);
+    }
+    const current = this.vaultBalances.get(symbol) || 0n;
+    this.vaultBalances.set(symbol, current + amount);
+  }
+
   public registerPoolDirect(token: string, initialFeeBps: bigint = 9n): void {
     const symbol = token.toUpperCase();
     if (this.reserves.has(symbol)) {
@@ -55,6 +73,7 @@ export class FlashLoanEngine {
       feeBps: initialFeeBps,
       isPaused: false
     });
+    this.vaultBalances.set(symbol, 0n);
     this.lpBalances.set(symbol, new Map());
   }
 
@@ -80,6 +99,7 @@ export class FlashLoanEngine {
 
     reserve.totalLiquidity += amount;
     reserve.totalShares += shares;
+    this.vaultBalances.set(symbol, (this.vaultBalances.get(symbol) || 0n) + amount);
 
     const userSharesMap = this.lpBalances.get(symbol)!;
     const currentShares = userSharesMap.get(user) || 0n;
@@ -111,6 +131,7 @@ export class FlashLoanEngine {
 
     reserve.totalLiquidity -= amount;
     reserve.totalShares -= shares;
+    this.vaultBalances.set(symbol, (this.vaultBalances.get(symbol) || 0n) - amount);
     const remainingShares = currentShares - shares;
     userSharesMap.set(user, remainingShares);
 
@@ -168,11 +189,12 @@ export class FlashLoanEngine {
     const fee = this.flashFee(symbol, amount);
     const snapshotLiquidity = reserve.totalLiquidity;
     const snapshotProtocolFees = reserve.accruedProtocolFees;
+    const vaultBalanceBefore = this.getVaultBalance(symbol);
     const initiator = options?.initiator || "0xInitiator";
 
     try {
-      // Simulate optimistic transfer of principal to borrower
-      reserve.totalLiquidity -= amount;
+      // Optimistic transfer of principal to borrower
+      this.vaultBalances.set(symbol, vaultBalanceBefore - amount);
 
       // Execute borrower's ERC-3156 callback
       const callbackResult = await receiver.onFlashLoan(initiator, symbol, amount, fee, data);
@@ -181,12 +203,31 @@ export class FlashLoanEngine {
         throw new Error(`ERC3156_CALLBACK_FAILED: Invalid return hash received '${callbackResult}'`);
       }
 
-      // Verify repayment (principal + fee)
-      if (options?.simulateRepayment) {
-        const repaid = await options.simulateRepayment(amount + fee);
-        if (!repaid) {
-          throw new Error("REPAYMENT_INSUFFICIENT_OR_FAILED: Borrower failed to return principal and fee");
+      // If an explicit repayment executor is provided via options, execute it
+      if (options?.repay) {
+        if (typeof options.repay === "function") {
+          const res = await options.repay(amount + fee);
+          if (typeof res === "bigint") {
+            this.vaultBalances.set(symbol, (this.vaultBalances.get(symbol) || 0n) + res);
+          } else if (res === true) {
+            this.vaultBalances.set(symbol, (this.vaultBalances.get(symbol) || 0n) + amount + fee);
+          }
+        } else if (options.repay === true) {
+          this.vaultBalances.set(symbol, (this.vaultBalances.get(symbol) || 0n) + amount + fee);
         }
+      } else if (options?.simulateRepayment) {
+        const repaid = await options.simulateRepayment(amount + fee);
+        if (repaid) {
+          this.vaultBalances.set(symbol, (this.vaultBalances.get(symbol) || 0n) + amount + fee);
+        }
+      }
+
+      // MANDATORY BALANCE VERIFICATION: Balance after MUST be >= vaultBalanceBefore + fee
+      const vaultBalanceAfter = this.getVaultBalance(symbol);
+      if (vaultBalanceAfter < vaultBalanceBefore + fee) {
+        throw new Error(
+          `REPAYMENT_INSUFFICIENT_OR_FAILED: Insufficient vault balance after callback (actual: ${vaultBalanceAfter}, required: ${vaultBalanceBefore + fee})`
+        );
       }
 
       // Compute fee split
@@ -210,6 +251,7 @@ export class FlashLoanEngine {
       };
     } catch (err: any) {
       // ATOMIC ROLLBACK: Guaranteed zero state mutation
+      this.vaultBalances.set(symbol, vaultBalanceBefore);
       reserve.totalLiquidity = snapshotLiquidity;
       reserve.accruedProtocolFees = snapshotProtocolFees;
       throw err;
